@@ -1,0 +1,176 @@
+---
+title: "hyperparameter-tuning"
+format: html
+---
+# Load in packages
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(powerjoin)
+library(glue)
+library(vip)
+library(baguette)
+library(dplyr)
+library(visdat)
+library(ggpubr)
+library(rsample)
+library(recipes)
+library(parsnip)
+library(workflows)
+library(tune)
+library(yardstick)
+```
+
+# Read in data
+```{r}
+root  <- 'https://gdex.ucar.edu/dataset/camels/file'
+
+download.file('https://gdex.ucar.edu/dataset/camels/file/camels_attributes_v2.0.pdf', 
+              'data/camels_attributes_v2.0.pdf')
+
+types <- c("clim", "geol", "soil", "topo", "vege", "hydro")
+
+# Where the files live online ...
+remote_files  <- glue('{root}/camels_{types}.txt')
+# where we want to download the data ...
+local_files   <- glue('data/camels_{types}.txt')
+walk2(remote_files, local_files, download.file, quiet = TRUE)
+# Read and merge data
+camels <- map(local_files, read_delim, show_col_types = FALSE) 
+camels <- power_full_join(camels ,by = 'gauge_id')
+```
+
+# Clean data
+```{r}
+vis_dat(camels)
+camels_clean <- camels %>%
+  drop_na()
+vis_dat(camels_clean)
+
+camels_clean <- camels_clean %>%
+  mutate(logQmean = log(q_mean))
+```
+
+# Data splitting
+```{r}
+set.seed(123)
+split_data <- initial_split(camels_clean, prop = 0.8)
+train_data <- training(split_data)
+test_data  <- testing(split_data)
+```
+
+# Feature engineering 
+```{r}
+rec <- recipe(q_mean ~ p_mean + elev_mean + slope_mean + aridity + runoff_ratio, 
+              data = camels_train) %>%
+  step_log(q_mean, base = exp(1)) %>% 
+  step_impute_median(all_numeric(), -all_outcomes()) %>%
+  step_normalize(all_numeric(), -all_outcomes())
+```
+
+# Resampling + Model Testing
+```{r}
+# Build resamples
+cv_splits <- vfold_cv(camels_train, v = 10)
+
+# Build 3 Candidate Models 
+# Linear regression 
+lin_spec <- linear_reg() %>%
+  set_engine("lm") %>%
+  set_mode("regression")
+
+# Random Forest 
+rf_spec <- rand_forest(trees = 500) %>%
+  set_engine("ranger") %>%
+  set_mode("regression")
+
+# Neural Network
+nn_spec <- mlp(hidden_units = 5, penalty = 0.01, epochs = 100) %>%
+  set_engine("nnet") %>%
+  set_mode("regression")
+
+# Workflows 
+lin_wf <- workflow() %>%
+  add_model(lin_spec) %>%
+  add_recipe(rec)
+
+rf_wf <- workflow() %>%
+  add_model(rf_spec) %>%
+  add_recipe(rec)
+
+nn_wf <- workflow() %>%
+  add_model(nn_spec) %>%
+  add_recipe(rec)
+
+# Test the model
+model_set <- workflow_set(
+  preproc = list(rec), 
+  models = list(lin_mod = lin_spec, rf_mod = rf_spec, nn_mod = nn_spec))
+
+cv_results <- workflow_map(
+  object = model_set,
+  resamples = cv_splits,
+  metrics = metric_set(rmse, rsq),  
+  verbose = TRUE)
+
+autoplot(cv_results)
+```
+
+# Model Selection 
+# Based on the results above, the neural network model is performing the best. This model has the lowest RMSE and the highest RSQ. This means that the model is making the most accurate predictions and that more of the variance is being explained by the model. 
+# The neural network is a deep learning model, composed of layers of interconnected nodes that are designed to caputre complex patterns and relationships within the data. The engine being used is nnet which allows us to train neural networks with one ore more hidden layers. The mode is regression mode since we are predicting a continuous outcome. Neural network is performing well because it is great at modeling complex non-linear relationships as we may often see in hydrological data. It is also good at handling large data sets with lots of predictors. 
+
+
+# Model Tuning 
+```{r}
+#1: Build a model 
+nn_spec <- mlp(hidden_units = tune(), penalty = tune()) %>%  
+  set_engine("nnet") %>%
+  set_mode("regression")
+#2: Create a workflow
+nn_wf <- workflow() %>%
+  add_model(nn_spec) %>%
+  add_recipe(rec)
+
+#3: Extract the parameter set dials for your model workflow
+dials <- extract_parameter_set_dials(nn_wf)
+
+# Check the object slot to see the tunable parameters and their ranges
+dials$object
+
+#4: Create a grid using Latin Hypercube sampling with size = 25
+my.grid <- grid_space_filling(dials$object, size = 25)
+head(my.grid)
+
+#5: Tune the model
+cv_results_nn <- tune_grid(
+  nn_wf,
+  resamples = cv_splits, 
+  grid = my.grid, 
+  metrics = metric_set(rmse, rsq, mae),
+  control = control_grid(save_pred = TRUE))
+autoplot(cv_results_nn)
+
+#6: Check the skill of the tuned model
+metrics_df <- collect_metrics(cv_results_nn)
+metrics_df %>%
+  filter(.metric == "mae") %>%        
+  arrange(mean)   
+show_best(cv_results_nn, metric = "mae", n = 1)
+autoplot(cv_results_nn)
+# Based on the results above, the best model is number of hidden units and regularization penalty. This is because the MAE of 0.8 indicates that the neural network has a relatively low prediction error. The hyperparameter combination of hidden_units = 100 and penalty = 0.01 produces this low error. 
+
+#Use the select_best() function to save the best performing hyperparameter set to an object called hp_best
+hp_best <- select_best(cv_results_nn, metric = "mae")
+hp_best
+
+# Finalize the model
+final_wf <- finalize_workflow(nn_wf, hp_best)
+final_wf
+```
+
+#Final model verification 
+```{r}
+
+```
+
