@@ -19,6 +19,7 @@ library(parsnip)
 library(workflows)
 library(tune)
 library(yardstick)
+library(ggplot2)
 ```
 
 # Read in data
@@ -55,13 +56,13 @@ camels_clean <- camels_clean %>%
 ```{r}
 set.seed(123)
 split_data <- initial_split(camels_clean, prop = 0.8)
-train_data <- training(split_data)
-test_data  <- testing(split_data)
+camels_train <- training(split_data)
+camels_test  <- testing(split_data)
 ```
 
 # Feature engineering 
 ```{r}
-rec <- recipe(q_mean ~ p_mean + elev_mean + slope_mean + aridity + runoff_ratio, 
+rec <- recipe(q_mean ~ p_mean + slope_mean + aridity, 
               data = camels_train) %>%
   step_log(q_mean, base = exp(1)) %>% 
   step_impute_median(all_numeric(), -all_outcomes()) %>%
@@ -171,6 +172,87 @@ final_wf
 
 #Final model verification 
 ```{r}
+final_results <- last_fit(final_wf, split = split_data)
+final_results
+
+final_metrics <- collect_metrics(final_results)
+print(final_metrics)
+
+# Interpretation: Based on the results, the model performs well on the test data. The RMSE value of 0.092 is very low, suggesting a low level of prediction error. The R-squared value of 0.996 is quite high, showing that the model performed well and that the model explains most of the variability in the q_mean. The final model is performing better than the training data, suggesting it good at generalization and is not overfitting. 
+
+final_predictions <- collect_predictions(final_results)
+print(final_predictions)
+
+final_predictions <- final_predictions %>%
+  mutate(id = row_number()) %>%
+  left_join(camels_test %>% mutate(id = row_number()), by = "id") %>%
+  select(-id)
+
+# Scatter plot
+
+ggplot(final_predictions, aes(x = camels_test$q_mean, y = .pred)) +
+  geom_point(aes(color = .pred), size = 3, alpha = 0.7) + 
+  geom_smooth(method = "lm", se = FALSE, color = "blue") +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+  scale_color_viridis_c() +
+  labs(
+    title = "Predicted vs Actual Values",
+    x = "Actual Values",
+    y = "Predicted Values",
+    color = "Predicted Value") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+# Building a map!
+```{r}
+# Fit the finalized workflow to the entire cleaned data (before splitting)
+final_model <- fit(final_wf, data = camels_clean)
+
+# Generate predictions and residuals
+full_predictions <- augment(final_model, new_data = camels_clean)
+
+# Calculate the residuals (actual - predicted)
+full_predictions <- full_predictions %>%
+  mutate(residuals = .pred - q_mean,        
+         residuals_squared = residuals^2)     
+
+
+# Map of Predictions
+library(ggplot2)
+map_predictions <- ggplot(full_predictions, aes(x = gauge_lon, y = gauge_lat, color = .pred)) +   borders("state", colour = "gray80", fill = NA) +
+  geom_point(size = 2, alpha = 0.7) +
+  coord_fixed(1.3) +
+  scale_color_viridis_c() +
+  labs(
+    title = "Predicted Streamflow Across CONUS",
+    x = "Longitude",
+    y = "Latitude",
+    color = "Predicted Qmean"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+# Map of residuals 
+map_residuals <- ggplot(full_predictions, aes(x = gauge_lon, y = gauge_lat, color = residuals)) +   borders("state", colour = "gray80", fill = NA) +
+  geom_point(size = 2, alpha = 0.7) +
+  coord_fixed(1.3) +
+  scale_color_viridis_c() +
+  labs(
+    title = "Residuals of Predicted Streamflow Across CONUS",
+    x = "Longitude",
+    y = "Latitude",
+    color = "Residuals"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+# Combined maps
+library(patchwork)
+combined_map <- map_predictions + map_residuals +
+  plot_layout(ncol = 1)  
+combined_map
+
 
 ```
 
